@@ -2,12 +2,12 @@
     "name": "ModernSite - Современный веб-сайт",
     "short_name": "ModernSite",
     "description": "Демонстрационный сайт с использованием HTML Living Standard, ECMAScript 2025 и CSS Snapshot 2025",
-    "start_url": "/",
+    "start_url": "./",
     "display": "standalone",
     "background_color": "#ffffff",
     "theme_color": "#3b82f6",
     "orientation": "portrait-primary",
-    "scope": "/",
+    "scope": "./",
     "lang": "ru",
     "categories": ["business", "productivity"],
     "icons": [
@@ -43,7 +43,7 @@
             "name": "О нас",
             "short_name": "About",
             "description": "Узнать больше о нашей команде",
-            "url": "/about.html",
+            "url": "./about.html",
             "icons": [
                 {
                     "src": "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iOTYiIGhlaWdodD0iOTYiIHZpZXdCb3g9IjAgMCA5NiA5NiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iNDgiIGN5PSI0OCIgcj0iNDgiIGZpbGw9IiMxMGI5ODEiLz4KPHN2ZyB4PSIyNCIgeT0iMjQiIHdpZHRoPSI0OCIgaGVpZ2h0PSI0OCIgdmlld0JveD0iMCAwIDQ4IDQ4IiBmaWxsPSJub25lIj4KPGNpcmNsZSBjeD0iMjQiIGN5PSIxOCIgcj0iOCIgZmlsbD0id2hpdGUiLz4KPHBhdGggZD0iTTEyIDQwUTI0IDQ0IDM2IDQwIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjMiIGZpbGw9Im5vbmUiLz4KPC9zdmc+Cjwvc3ZnPg==",
@@ -56,7 +56,7 @@
             "name": "Услуги",
             "short_name": "Services",
             "description": "Наши услуги и решения",
-            "url": "/services.html",
+            "url": "./services.html",
             "icons": [
                 {
                     "src": "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iOTYiIGhlaWdodD0iOTYiIHZpZXdCb3g9IjAgMCA5NiA5NiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iNDgiIGN5PSI0OCIgcj0iNDgiIGZpbGw9IiNmNTllMGIiLz4KPHN2ZyB4PSIyMCIgeT0iMjAiIHdpZHRoPSI1NiIgaGVpZ2h0PSI1NiIgdmlld0JveD0iMCAwIDU2IDU2IiBmaWxsPSJub25lIj4KPHJlY3QgeD0iOCIgeT0iMTYiIHdpZHRoPSI0MCIgaGVpZ2h0PSIyNCIgcng9IjMiIGZpbGw9IndoaXRlIi8+CjxjaXJjbGUgY3g9IjI4IiBjeT0iMjgiIHI9IjQiIGZpbGw9IiNmNTllMGIiLz4KPC9zdmc+Cjwvc3ZnPg==",
@@ -69,7 +69,7 @@
             "name": "Контакты",
             "short_name": "Contact",
             "description": "Связаться с нами",
-            "url": "/contact.html",
+            "url": "./contact.html",
             "icons": [
                 {
                     "src": "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iOTYiIGhlaWdodD0iOTYiIHZpZXdCb3g9IjAgMCA5NiA5NiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iNDgiIGN5PSI0OCIgcj0iNDgiIGZpbGw9IiNlZjQ0NDQiLz4KPHN2ZyB4PSIyMCIgeT0iMjAiIHdpZHRoPSI1NiIgaGVpZ2h0PSI1NiIgdmlld0JveD0iMCAwIDU2IDU2IiBmaWxsPSJub25lIj4KPHBhdGggZD0iTTggMjBMMjguNSAzM0w0OCAyME0xMiA0NEg0NEE0IDQgMCAwIDAgNDggNDBWMjRBNCA0IDAgMCAwIDQ0IDIwSDEyQTQgNCAwIDAgMCA4IDI0VjQwQTQgNCAwIDAgMCAxMiA0NFoiIHN0cm9rZT0id2hpdGUiIHN0cm9rZS13aWR0aD0iMiIgZmlsbD0ibm9uZSIvPgo8L3N2Zz4KPC9zdmc+",

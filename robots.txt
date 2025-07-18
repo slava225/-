@@ -1,0 +1,11 @@
+User-agent: *
+Allow: /
+
+# Sitemap location (обновите URL после деплоя)
+Sitemap: https://slava225.github.io/sitemap.xml
+
+# Block sensitive files
+Disallow: /.git/
+Disallow: /.github/
+Disallow: /sw.js
+Disallow: /manifest.json

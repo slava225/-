@@ -1,14 +1,18 @@
 // Service Worker for ModernSite PWA
 const CACHE_NAME = 'modernsite-v1.0.0';
+
+// Determine base path for GitHub Pages
+const BASE_PATH = location.pathname.substring(0, location.pathname.lastIndexOf('/') + 1);
+
 const STATIC_ASSETS = [
-    '/',
-    '/index.html',
-    '/about.html',
-    '/services.html',
-    '/contact.html',
-    '/styles/main.css',
-    '/scripts/main.js',
-    '/manifest.json'
+    BASE_PATH,
+    `${BASE_PATH}index.html`,
+    `${BASE_PATH}about.html`,
+    `${BASE_PATH}services.html`,
+    `${BASE_PATH}contact.html`,
+    `${BASE_PATH}styles/main.css`,
+    `${BASE_PATH}scripts/main.js`,
+    `${BASE_PATH}manifest.json`
 ];
 
 // Install event - cache static assets
@@ -97,7 +101,7 @@ self.addEventListener('fetch', event => {
                         
                         // Return offline fallback for HTML pages
                         if (event.request.destination === 'document') {
-                            return caches.match('/index.html');
+                            return caches.match(`${BASE_PATH}index.html`);
                         }
                         
                         // For other resources, just let the error propagate
@@ -160,7 +164,7 @@ self.addEventListener('notificationclick', event => {
     if (event.action === 'explore') {
         // Open the website
         event.waitUntil(
-            clients.openWindow('/')
+            clients.openWindow(BASE_PATH)
         );
     }
 });
