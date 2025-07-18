@@ -43,43 +43,51 @@ class PageTransitions {
     }
 
     setupLinkTransitions() {
-        // Get all internal links
+        // Get all internal links but exclude external and special links
         const links = document.querySelectorAll('a[href^="./"], a[href^="index.html"], a[href^="about.html"], a[href^="services.html"], a[href^="contact.html"]');
         
         links.forEach(link => {
+            // Skip if it's a button in form or has special attributes
+            if (link.closest('form') || link.hasAttribute('target') || link.getAttribute('href') === '#') {
+                return;
+            }
+            
             link.addEventListener('click', (e) => {
-                e.preventDefault();
                 const href = link.getAttribute('href');
                 
-                if (href && href !== '#') {
-                    this.transitionToPage(href);
+                // Allow normal navigation for same page or hash links
+                if (!href || href === '#' || href === window.location.pathname) {
+                    return;
                 }
+                
+                // Only prevent default for actual page transitions
+                e.preventDefault();
+                this.transitionToPage(href);
             });
         });
     }
 
     transitionToPage(href) {
-        // Add exit animation
-        document.body.style.opacity = '0.8';
-        document.body.style.transform = 'translateX(-20px)';
-        document.body.style.transition = 'all 0.3s ease-out';
+        // Quick fade out without transform to prevent layout issues
+        document.body.style.transition = 'opacity 0.2s ease-out';
+        document.body.style.opacity = '0.7';
 
-        // Navigate after animation
+        // Navigate quickly to prevent old design flash
         setTimeout(() => {
             window.location.href = href;
-        }, 300);
+        }, 150);
     }
 
     animateOnLoad() {
-        // Add loading animation to body
+        // Ensure CSS is loaded first
         document.body.style.opacity = '0';
-        document.body.style.transform = 'translateX(20px)';
         
-        setTimeout(() => {
-            document.body.style.transition = 'all 0.5s ease-out';
+        // Quick reveal with proper styles
+        requestAnimationFrame(() => {
+            document.body.style.transition = 'opacity 0.3s ease-out';
             document.body.style.opacity = '1';
-            document.body.style.transform = 'translateX(0)';
-        }, 100);
+            document.body.style.transform = 'none';
+        });
     }
 }
 
