@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -11,6 +12,7 @@ import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
@@ -37,6 +39,9 @@ public class MainActivity extends AppCompatActivity {
     private MediaProjectionManager projectionManager;
     private Intent projectionData;
     private int projectionResultCode = Activity.RESULT_CANCELED;
+    private Uri selectedVideoUri;
+    private String currentMode = SubtitleSettings.MODE_LIVE;
+    private boolean updatingModeUi;
 
     private RadioGroup sourceGroup;
     private TextView overlayState;
@@ -44,8 +49,13 @@ public class MainActivity extends AppCompatActivity {
     private TextView captureState;
     private TextView modelState;
     private TextView status;
+    private TextView modeHint;
+    private TextView selectedVideoState;
     private Button captureButton;
     private Button startButton;
+    private Button videoTab;
+    private Button liveTab;
+    private LinearLayout videoPickerCard;
     private SwitchCompat speechToggle;
     private SwitchCompat ocrToggle;
     private SwitchCompat originalToggle;
@@ -68,29 +78,32 @@ public class MainActivity extends AppCompatActivity {
     private final ActivityResultLauncher<String[]> permissionsLauncher =
             registerForActivityResult(new ActivityResultContracts.RequestMultiplePermissions(), result -> {
                 updatePermissionCards();
-                if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                if (speechToggle != null && speechToggle.isChecked()
+                        && ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                         != PackageManager.PERMISSION_GRANTED) {
-                    setStatus("Разрешение на микрофон нужно даже для системного звука — Android требует его для AudioPlaybackCapture.", true);
+                    setStatus("Для перевода речи нужно разрешение на микрофон. Перевод изображения может работать без него.", true);
                 }
             });
 
-    private final ActivityResultLauncher<String> openVideoLauncher =
-            registerForActivityResult(new ActivityResultContracts.GetContent(), uri -> {
+    private final ActivityResultLauncher<String[]> openVideoLauncher =
+            registerForActivityResult(new ActivityResultContracts.OpenDocument(), uri -> {
                 if (uri == null) return;
-                Intent view = new Intent(Intent.ACTION_VIEW);
-                view.setDataAndType(uri, "video/*");
-                view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                selectedVideoUri = uri;
                 try {
-                    startActivity(view);
-                } catch (Exception e) {
-                    Toast.makeText(this, "Не найден видеоплеер для этого файла", Toast.LENGTH_LONG).show();
+                    getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                } catch (Exception ignored) { }
+                if (selectedVideoState != null) {
+                    selectedVideoState.setText("✓  Выбрано: " + displayName(uri));
+                    selectedVideoState.setTextColor(0xff7ce3ac);
                 }
+                setStatus("Видео выбрано. Выдай доступ к экрану и запускай перевод.", false);
             });
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         projectionManager = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+        currentMode = SubtitleSettings.lastMode(this);
         setContentView(buildUi());
         requestBasicPermissions();
     }
@@ -114,22 +127,57 @@ public class MainActivity extends AppCompatActivity {
         root.setPadding(dp(18), dp(20), dp(18), dp(32));
         scroll.addView(root, new ScrollView.LayoutParams(-1, -2));
 
-        TextView badge = label("LIVE TRANSLATE", 12, true, 0xff9cb6ff);
+        TextView badge = label("CHINESE → RUSSIAN", 12, true, 0xff9cb6ff);
         badge.setPadding(dp(10), dp(6), dp(10), dp(6));
         badge.setBackground(rounded(0xff18213a, 99, 0xff2e416f));
-        LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(-2, -2);
-        root.addView(badge, badgeLp);
+        root.addView(badge, new LinearLayout.LayoutParams(-2, -2));
 
-        TextView title = label("Китайский → Русский", 30, true, Color.WHITE);
+        TextView title = label("Перевод видео и эфиров", 29, true, Color.WHITE);
         LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(-1, -2);
         titleLp.topMargin = dp(14);
         root.addView(title, titleLp);
 
-        TextView intro = label("Живые русские субтитры для видео и трансляций + перевод китайского текста прямо с экрана.", 16, false, 0xffaeb9cf);
+        TextView intro = label(
+                "Выбери режим ниже. Перевод речи и перевод китайского текста с изображения управляются отдельно.",
+                16, false, 0xffaeb9cf);
         LinearLayout.LayoutParams introLp = new LinearLayout.LayoutParams(-1, -2);
         introLp.topMargin = dp(7);
-        introLp.bottomMargin = dp(18);
+        introLp.bottomMargin = dp(16);
         root.addView(intro, introLp);
+
+        root.addView(sectionTitle("Режим"));
+        LinearLayout tabCard = card();
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        videoTab = tabButton("▶  Видео");
+        liveTab = tabButton("●  Трансляция");
+        tabs.addView(videoTab, new LinearLayout.LayoutParams(0, dp(52), 1f));
+        LinearLayout.LayoutParams liveLp = new LinearLayout.LayoutParams(0, dp(52), 1f);
+        liveLp.leftMargin = dp(8);
+        tabs.addView(liveTab, liveLp);
+        tabCard.addView(tabs);
+
+        modeHint = label("", 13, false, 0xff9eabc2);
+        LinearLayout.LayoutParams hintLp = new LinearLayout.LayoutParams(-1, -2);
+        hintLp.topMargin = dp(10);
+        tabCard.addView(modeHint, hintLp);
+        root.addView(tabCard, cardLp());
+
+        videoTab.setOnClickListener(v -> setMode(SubtitleSettings.MODE_VIDEO));
+        liveTab.setOnClickListener(v -> setMode(SubtitleSettings.MODE_LIVE));
+
+        videoPickerCard = card();
+        TextView videoTitle = label("Видео с телефона", 16, true, 0xffe8efff);
+        videoPickerCard.addView(videoTitle);
+        selectedVideoState = label("Видео пока не выбрано", 13, false, 0xff8e9bb2);
+        LinearLayout.LayoutParams selectedLp = new LinearLayout.LayoutParams(-1, -2);
+        selectedLp.topMargin = dp(6);
+        selectedLp.bottomMargin = dp(5);
+        videoPickerCard.addView(selectedVideoState, selectedLp);
+        Button selectVideo = primaryButton("Выбрать видео", false);
+        selectVideo.setOnClickListener(v -> openVideoLauncher.launch(new String[]{"video/*"}));
+        videoPickerCard.addView(selectVideo, buttonLp());
+        root.addView(videoPickerCard, cardLp());
 
         root.addView(sectionTitle("Готовность"));
         LinearLayout readiness = card();
@@ -139,7 +187,7 @@ public class MainActivity extends AppCompatActivity {
         modelState = stateRow(readiness, "Модель китайской речи");
         root.addView(readiness, cardLp());
 
-        root.addView(sectionTitle("1. Разрешения"));
+        root.addView(sectionTitle("Разрешения"));
         LinearLayout permissionsCard = card();
         Button overlayButton = primaryButton("Разрешить показ поверх окон", false);
         overlayButton.setOnClickListener(v -> requestOverlayPermission());
@@ -150,7 +198,7 @@ public class MainActivity extends AppCompatActivity {
         permissionsCard.addView(captureButton, buttonLp());
         root.addView(permissionsCard, cardLp());
 
-        root.addView(sectionTitle("2. Источник речи"));
+        root.addView(sectionTitle("Источник речи"));
         LinearLayout sourceCard = card();
         sourceGroup = new RadioGroup(this);
         sourceGroup.setOrientation(RadioGroup.VERTICAL);
@@ -162,20 +210,26 @@ public class MainActivity extends AppCompatActivity {
         sourceCard.addView(sourceGroup, new LinearLayout.LayoutParams(-1, -2));
         root.addView(sourceCard, cardLp());
 
-        root.addView(sectionTitle("3. Что переводить"));
+        root.addView(sectionTitle("Что переводить"));
         LinearLayout modeCard = card();
-        speechToggle = switchLike("Речь → русские субтитры", SubtitleSettings.speechEnabled(this));
-        ocrToggle = switchLike("Китайский текст с экрана", SubtitleSettings.ocrEnabled(this));
-        originalToggle = switchLike("Показывать оригинальный китайский", SubtitleSettings.showOriginal(this));
+        speechToggle = switchLike("Речь → русские субтитры", true);
+        ocrToggle = switchLike("Перевод китайского текста с изображения", false);
+        originalToggle = switchLike("Показывать китайский оригинал над переводом", SubtitleSettings.showOriginal(this));
         modeCard.addView(speechToggle);
         modeCard.addView(ocrToggle);
+
+        TextView ocrNote = label(
+                "Перевод изображения выключен по умолчанию. Включай его только когда в кадре действительно нужно переводить китайские надписи. Латиница, цифры и обычный интерфейс отбрасываются.",
+                12, false, 0xff8492aa);
+        ocrNote.setPadding(dp(4), 0, dp(4), dp(8));
+        modeCard.addView(ocrNote);
         modeCard.addView(originalToggle);
         root.addView(modeCard, cardLp());
 
-        root.addView(sectionTitle("4. Вид субтитров"));
+        root.addView(sectionTitle("Вид субтитров"));
         LinearLayout styleCard = card();
         styleCard.addView(sliderBlock("Размер речи", 16, 28, SubtitleSettings.speechSize(this), "speech_size"));
-        styleCard.addView(sliderBlock("Размер текста с экрана", 12, 22, SubtitleSettings.ocrSize(this), "ocr_size"));
+        styleCard.addView(sliderBlock("Размер текста с изображения", 12, 22, SubtitleSettings.ocrSize(this), "ocr_size"));
         styleCard.addView(sliderBlock("Прозрачность фона", 35, 90, SubtitleSettings.backgroundAlpha(this), "background_alpha"));
         root.addView(styleCard, cardLp());
 
@@ -184,10 +238,6 @@ public class MainActivity extends AppCompatActivity {
         startButton = primaryButton("▶  Запустить перевод", true);
         startButton.setOnClickListener(v -> startTranslation());
         launchCard.addView(startButton, buttonLp());
-
-        Button openVideo = primaryButton("Открыть видео с телефона", false);
-        openVideo.setOnClickListener(v -> openVideoLauncher.launch("video/*"));
-        launchCard.addView(openVideo, buttonLp());
 
         Button stop = dangerButton("Остановить перевод");
         stop.setOnClickListener(v -> stopTranslation());
@@ -202,29 +252,67 @@ public class MainActivity extends AppCompatActivity {
         root.addView(status, statusLp);
 
         TextView help = label(
-                "Если у стрима нет субтитров в режиме системного звука, переключись на «Микрофон». На vivo / OriginOS также разреши автозапуск, работу в фоне и убери ограничения батареи.",
+                "Для трансляции: запусти перевод и открой эфир. Для видео: сначала выбери файл — после запуска приложение само откроет его в видеоплеере. Если системный звук не ловится, используй «Микрофон».",
                 13, false, 0xff7f8da7);
         LinearLayout.LayoutParams helpLp = new LinearLayout.LayoutParams(-1, -2);
         helpLp.topMargin = dp(14);
         root.addView(help, helpLp);
 
-        speechToggle.setOnCheckedChangeListener((buttonView, isChecked) -> saveToggle("speech_enabled", isChecked));
-        ocrToggle.setOnCheckedChangeListener((buttonView, isChecked) -> saveToggle("ocr_enabled", isChecked));
-        originalToggle.setOnCheckedChangeListener((buttonView, isChecked) -> saveToggle("show_original", isChecked));
+        speechToggle.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (!updatingModeUi) SubtitleSettings.setSpeechEnabled(this, currentMode, isChecked);
+        });
+        ocrToggle.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (!updatingModeUi) SubtitleSettings.setOcrEnabled(this, currentMode, isChecked);
+        });
+        originalToggle.setOnCheckedChangeListener((buttonView, isChecked) ->
+                SubtitleSettings.prefs(this).edit().putBoolean("show_original", isChecked).apply());
 
+        applyModeUi();
         updatePermissionCards();
         return shell;
+    }
+
+    private void setMode(String mode) {
+        currentMode = SubtitleSettings.normalizeMode(mode);
+        SubtitleSettings.setLastMode(this, currentMode);
+        applyModeUi();
+        setStatus(SubtitleSettings.MODE_VIDEO.equals(currentMode)
+                ? "Режим видео выбран. Выбери файл, если ещё не выбрал."
+                : "Режим трансляции выбран. После запуска открой нужный прямой эфир.", false);
+    }
+
+    private void applyModeUi() {
+        if (videoTab == null || liveTab == null) return;
+        boolean video = SubtitleSettings.MODE_VIDEO.equals(currentMode);
+        styleTab(videoTab, video);
+        styleTab(liveTab, !video);
+
+        if (modeHint != null) {
+            modeHint.setText(video
+                    ? "Видео: выбираешь файл на телефоне, запускаешь перевод — видео откроется автоматически."
+                    : "Трансляция: запускаешь перевод, сворачиваешь приложение и открываешь Bilibili, Weibo, браузер или другой эфир.");
+        }
+        if (videoPickerCard != null) videoPickerCard.setVisibility(video ? View.VISIBLE : View.GONE);
+
+        updatingModeUi = true;
+        if (speechToggle != null) speechToggle.setChecked(SubtitleSettings.speechEnabled(this, currentMode));
+        if (ocrToggle != null) {
+            ocrToggle.setChecked(SubtitleSettings.ocrEnabled(this, currentMode));
+            ocrToggle.setText(video
+                    ? "Перевод китайского текста/надписей в кадре"
+                    : "Перевод китайского текста/картинок в эфире");
+        }
+        updatingModeUi = false;
+
+        if (startButton != null) {
+            startButton.setText(video ? "▶  Запустить перевод видео" : "●  Запустить перевод трансляции");
+        }
     }
 
     private void requestScreenCapture() {
         if (!Settings.canDrawOverlays(this)) {
             setStatus("Сначала разреши показ поверх других приложений.", true);
             requestOverlayPermission();
-            return;
-        }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            permissionsLauncher.launch(new String[]{Manifest.permission.RECORD_AUDIO});
-            setStatus("Сначала разреши доступ к микрофону.", true);
             return;
         }
         setStatus("Подтверди системное окно Android для захвата экрана.", false);
@@ -238,9 +326,10 @@ public class MainActivity extends AppCompatActivity {
             requestOverlayPermission();
             return;
         }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+        if (speechToggle.isChecked()
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             permissionsLauncher.launch(new String[]{Manifest.permission.RECORD_AUDIO});
-            setStatus("Нет разрешения на микрофон.", true);
+            setStatus("Для перевода речи нужно разрешение на микрофон. Если нужна только картинка — выключи перевод речи.", true);
             return;
         }
         if (projectionResultCode != Activity.RESULT_OK || projectionData == null) {
@@ -249,7 +338,12 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         if (!speechToggle.isChecked() && !ocrToggle.isChecked()) {
-            setStatus("Включи хотя бы перевод речи или перевод текста с экрана.", true);
+            setStatus("Включи хотя бы перевод речи или перевод китайского текста с изображения.", true);
+            return;
+        }
+        if (SubtitleSettings.MODE_VIDEO.equals(currentMode) && selectedVideoUri == null) {
+            setStatus("Во вкладке «Видео» сначала выбери видео с телефона.", true);
+            openVideoLauncher.launch(new String[]{"video/*"});
             return;
         }
 
@@ -260,13 +354,32 @@ public class MainActivity extends AppCompatActivity {
                 sourceGroup.getCheckedRadioButtonId() == ID_MIC ? "mic" : "system");
         service.putExtra(TranslationOverlayService.EXTRA_ENABLE_SPEECH, speechToggle.isChecked());
         service.putExtra(TranslationOverlayService.EXTRA_ENABLE_OCR, ocrToggle.isChecked());
+        service.putExtra(TranslationOverlayService.EXTRA_MODE, currentMode);
         ContextCompat.startForegroundService(this, service);
 
         projectionData = null;
         projectionResultCode = Activity.RESULT_CANCELED;
         updatePermissionCards();
-        setStatus("Перевод запущен. Открой видео или прямой эфир — субтитры появятся поверх него.", false);
-        Toast.makeText(this, "LIVE-перевод запущен", Toast.LENGTH_LONG).show();
+
+        if (SubtitleSettings.MODE_VIDEO.equals(currentMode)) {
+            setStatus("Перевод видео запущен. Открываю выбранный файл…", false);
+            startButton.postDelayed(this::launchSelectedVideo, 450);
+        } else {
+            setStatus("Перевод трансляции запущен. Теперь открой нужный прямой эфир.", false);
+            Toast.makeText(this, "Перевод эфира запущен", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void launchSelectedVideo() {
+        if (selectedVideoUri == null) return;
+        Intent view = new Intent(Intent.ACTION_VIEW);
+        view.setDataAndType(selectedVideoUri, "video/*");
+        view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivity(view);
+        } catch (Exception e) {
+            setStatus("Не найден видеоплеер для выбранного файла.", true);
+        }
     }
 
     private void stopTranslation() {
@@ -302,11 +415,28 @@ public class MainActivity extends AppCompatActivity {
                 "Выдано на текущий запуск", "Нужно выдать");
 
         java.io.File model = new java.io.File(getFilesDir(), "models/" + VoskModelManager.MODEL_DIR + "/am/final.mdl");
-        setState(modelState, model.exists(), "Установлена", "Скачается при первом запуске");
+        setState(modelState, model.exists(), "Установлена", "Скачается при первом переводе речи");
 
         if (captureButton != null) {
             captureButton.setText((projectionData != null) ? "✓ Доступ к экрану выдан" : "Выдать доступ к захвату экрана");
         }
+    }
+
+    private String displayName(Uri uri) {
+        String name = "video";
+        try (Cursor cursor = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (index >= 0) name = cursor.getString(index);
+            }
+        } catch (Exception ignored) { }
+        return name == null ? "video" : name;
+    }
+
+    private void saveUiSettings() {
+        SubtitleSettings.setSpeechEnabled(this, currentMode, speechToggle.isChecked());
+        SubtitleSettings.setOcrEnabled(this, currentMode, ocrToggle.isChecked());
+        SubtitleSettings.prefs(this).edit().putBoolean("show_original", originalToggle.isChecked()).apply();
     }
 
     private void setState(TextView tv, boolean ok, String yes, String no) {
@@ -348,16 +478,32 @@ public class MainActivity extends AppCompatActivity {
         return cb;
     }
 
+    private Button tabButton(String text) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setAllCaps(false);
+        b.setTextSize(15);
+        b.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(8), dp(8), dp(8), dp(8));
+        return b;
+    }
+
+    private void styleTab(Button button, boolean active) {
+        button.setTextColor(active ? Color.WHITE : 0xff94a2bb);
+        button.setBackground(rounded(active ? 0xff5f7fff : 0xff151d2d, 15,
+                active ? 0xff8aa0ff : 0xff2d3b54));
+    }
+
     private View sliderBlock(String title, int min, int max, int current, String key) {
         LinearLayout block = new LinearLayout(this);
         block.setOrientation(LinearLayout.VERTICAL);
         block.setPadding(0, dp(8), 0, dp(8));
-        TextView value = label(title + ": " + current, 14, true, 0xffdce5f7);
+        TextView value = label(title + ": " + current + (key.contains("alpha") ? "%" : ""), 14, true, 0xffdce5f7);
         block.addView(value, new LinearLayout.LayoutParams(-1, -2));
         SeekBar seek = new SeekBar(this);
         seek.setMax(max - min);
         seek.setProgress(Math.max(0, Math.min(max - min, current - min)));
-        seek.setTag(key);
         seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 int actual = min + progress;
@@ -369,16 +515,6 @@ public class MainActivity extends AppCompatActivity {
         });
         block.addView(seek, new LinearLayout.LayoutParams(-1, -2));
         return block;
-    }
-
-    private void saveToggle(String key, boolean value) {
-        SubtitleSettings.prefs(this).edit().putBoolean(key, value).apply();
-    }
-
-    private void saveUiSettings() {
-        saveToggle("speech_enabled", speechToggle.isChecked());
-        saveToggle("ocr_enabled", ocrToggle.isChecked());
-        saveToggle("show_original", originalToggle.isChecked());
     }
 
     private LinearLayout card() {
