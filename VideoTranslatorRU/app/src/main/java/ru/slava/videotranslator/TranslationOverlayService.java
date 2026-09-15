@@ -77,7 +77,8 @@ public class TranslationOverlayService extends Service {
     private String pendingOcrSource = "";
     private int pendingOcrHits = 0;
     private String lastSpeechSource = "";
-    private long speechShownSeq = 0L;
+    private String lastConfirmedChinese = "";
+
     private final AtomicBoolean ocrBusy = new AtomicBoolean(false);
     private final AtomicLong speechRequestSeq = new AtomicLong(0L);
     private final AtomicLong ocrRequestSeq = new AtomicLong(0L);
@@ -113,9 +114,8 @@ public class TranslationOverlayService extends Service {
 
         int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED);
         Intent data;
-        if (Build.VERSION.SDK_INT >= 33) {
-            data = intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent.class);
-        } else {
+        if (Build.VERSION.SDK_INT >= 33) data = intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent.class);
+        else {
             //noinspection deprecation
             data = intent.getParcelableExtra(EXTRA_RESULT_DATA);
         }
@@ -129,7 +129,7 @@ public class TranslationOverlayService extends Service {
         startAsForeground(useMic);
 
         if (resultCode != Activity.RESULT_OK || data == null) {
-            showFatal("Android не передал разрешение на захват экрана. Вернись в приложение и выдай доступ ещё раз.");
+            showFatal("Android не передал разрешение на захват экрана. Выдай доступ ещё раз.");
             return START_NOT_STICKY;
         }
         if (!Settings.canDrawOverlays(this)) {
@@ -138,8 +138,7 @@ public class TranslationOverlayService extends Service {
         }
 
         createOverlay();
-        setStatus(modeLabel() + " • " + (useMic ? "микрофон" : "системный звук")
-                + (enableOcr ? " • изображение ВКЛ" : " • изображение ВЫКЛ"));
+        setStatus(modeLabel() + " • ТОЧНЫЙ ПЕРЕВОД");
 
         try {
             MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
@@ -151,10 +150,9 @@ public class TranslationOverlayService extends Service {
             projection.registerCallback(new MediaProjection.Callback() {
                 @Override public void onStop() { stopSelf(); }
             }, mainHandler);
-
             prepareTranslationAndFeatures();
         } catch (SecurityException e) {
-            showFatal("Android отклонил захват экрана. На Android 14+ разрешение нужно выдавать заново перед каждым запуском.");
+            showFatal("Android отклонил захват экрана. Разрешение нужно выдать заново.");
         } catch (Exception e) {
             showFatal("Ошибка запуска: " + safeMessage(e));
         }
@@ -162,7 +160,7 @@ public class TranslationOverlayService extends Service {
     }
 
     private void prepareTranslationAndFeatures() {
-        setStatus(modeLabel() + " • готовлю переводчик…");
+        setStatus(modeLabel() + " • готовлю точный переводчик…");
         translation.prepare(() -> {
             if (enableOcr) {
                 try {
@@ -179,9 +177,9 @@ public class TranslationOverlayService extends Service {
             }
 
             modelManager.ensureModel(this::setStatus, modelFile -> {
-                setStatus(modeLabel() + " • LIVE • " + (useMic ? "микрофон" : "системный звук"));
+                setStatus(modeLabel() + " • ТОЧНО • " + (useMic ? "микрофон" : "системный звук"));
                 transcriber = new AudioTranscriber(this, projection, useMic);
-                transcriber.start(modelFile, this::onChineseSpeech, message -> {
+                transcriber.start(modelFile, this::onChineseTranscript, message -> {
                     setStatus(message);
                     if (message != null && message.startsWith("Ошибка распознавания речи") && !useMic) {
                         setStatus("Системный звук недоступен — попробуй режим «Микрофон»");
@@ -191,10 +189,10 @@ public class TranslationOverlayService extends Service {
         }, e -> setStatus("Не удалось скачать модель перевода: " + safeMessage(e)));
     }
 
-    private void onChineseSpeech(String rawChinese) {
-        if (!enableSpeech || rawChinese == null) return;
+    private void onChineseTranscript(AudioTranscriber.Transcript transcript) {
+        if (!enableSpeech || transcript == null) return;
 
-        String chinese = normalizeSpeechChinese(rawChinese);
+        String chinese = normalizeSpeechChinese(transcript.text);
         if (chinese.isEmpty()) {
             speechRequestSeq.incrementAndGet();
             lastSpeechSource = "";
@@ -203,44 +201,70 @@ public class TranslationOverlayService extends Service {
             return;
         }
 
-        if (countHan(chinese) < 2 && chinese.length() < 4) return;
-        if (chinese.equals(lastSpeechSource)) return;
+        int han = countHan(chinese);
+        if (han < 2 && chinese.length() < 4) return;
+
+        // Partial results must be reasonably substantial; otherwise incomplete Chinese produces
+        // a grammatically plausible but semantically wrong Russian sentence.
+        if (!transcript.isFinal) {
+            if (han < 5) return;
+            if (transcript.confidence > 0f && transcript.confidence < 0.52f) return;
+        } else {
+            // Low confidence short final hypotheses are the most common source of completely wrong
+            // translations. Longer phrases have more context, so allow a slightly lower score.
+            float minFinalConfidence = han >= 9 ? 0.34f : 0.42f;
+            if (transcript.confidence > 0f && transcript.confidence < minFinalConfidence) {
+                setStatus(modeLabel() + " • пропустил сомнительную фразу");
+                return;
+            }
+        }
+
+        if (chinese.equals(lastSpeechSource) && !transcript.isFinal) return;
         lastSpeechSource = chinese;
 
+        final String source = transcript.isFinal ? ensureChineseSentence(chinese) : chinese;
+        final String previousContext = lastConfirmedChinese;
+        final boolean finalHypothesis = transcript.isFinal;
         final long requestId = speechRequestSeq.incrementAndGet();
-        final String source = chinese;
 
-        // If recognition has already moved to a newer phrase but its translation is slow,
-        // do not leave an old subtitle stuck on screen.
+        // As soon as a newer phrase appears, an old translation is no longer allowed to win.
         mainHandler.postDelayed(() -> {
-            long latest = speechRequestSeq.get();
-            if (requestId == latest && speechShownSeq < requestId - 1) {
+            if (requestId == speechRequestSeq.get() && speechText != null
+                    && speechText.getText().length() > 0 && !finalHypothesis) {
                 setCardVisible(speechCard, false);
             }
-        }, 700L);
+        }, 850L);
 
-        translation.translate(source, ru -> runOnMain(() -> {
-            long latest = speechRequestSeq.get();
-            // Accept current or immediately previous live request, but reject genuinely stale
-            // translations that finish after the speaker has already moved on.
-            if (requestId < latest - 1) return;
+        translation.translateAccurate(previousContext, source, ru -> runOnMain(() -> {
+            if (requestId != speechRequestSeq.get()) return;
             if (ru == null || ru.trim().isEmpty()) return;
 
-            speechShownSeq = requestId;
-            String text = showOriginal ? source + "\n" + ru.trim() : ru.trim();
+            String cleanRu = ru.trim();
+            String text = showOriginal ? source + "\n" + cleanRu : cleanRu;
             speechText.setText(text);
             setCardVisible(speechCard, true);
             mainHandler.removeCallbacks(hideSpeech);
-            mainHandler.postDelayed(hideSpeech, 2300L);
+            mainHandler.postDelayed(hideSpeech, finalHypothesis ? 3200L : 1700L);
+
+            if (finalHypothesis) {
+                lastConfirmedChinese = source;
+                if (lastConfirmedChinese.length() > 100) {
+                    lastConfirmedChinese = lastConfirmedChinese.substring(lastConfirmedChinese.length() - 100);
+                }
+                setStatus(modeLabel() + " • ТОЧНО • перевод подтверждён");
+            }
         }));
     }
 
-    /**
-     * Vosk commonly returns Mandarin tokens separated by spaces, e.g. "今 天 我 们".
-     * ML Kit translates natural Chinese significantly better when adjacent Han tokens are joined.
-     */
+    private String ensureChineseSentence(String text) {
+        if (text == null || text.isEmpty()) return "";
+        char last = text.charAt(text.length() - 1);
+        if (last == '。' || last == '！' || last == '？' || last == '!' || last == '?') return text;
+        return text + "。";
+    }
+
     private String normalizeSpeechChinese(String raw) {
-        String cleaned = raw.replaceAll("[\\t\\r\\n ]+", " ").trim();
+        String cleaned = raw == null ? "" : raw.replaceAll("[\\t\\r\\n ]+", " ").trim();
         if (cleaned.isEmpty()) return "";
         String[] parts = cleaned.split(" ");
         StringBuilder out = new StringBuilder();
@@ -253,7 +277,7 @@ public class TranslationOverlayService extends Service {
             }
             out.append(part);
         }
-        return out.toString().trim();
+        return out.toString().replaceAll("([\\p{IsHan}])\\1{2,}", "$1$1").trim();
     }
 
     private int countHan(String value) {
@@ -272,7 +296,6 @@ public class TranslationOverlayService extends Service {
 
     private void startScreenCapture() {
         if (virtualDisplay != null || projection == null) return;
-
         android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
         int width = dm.widthPixels;
         int height = dm.heightPixels;
@@ -300,8 +323,7 @@ public class TranslationOverlayService extends Service {
         }, imageHandler);
 
         virtualDisplay = projection.createVirtualDisplay(
-                "ChineseImageTranslator",
-                width, height, density,
+                "ChineseImageTranslator", width, height, density,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 imageReader.getSurface(), null, imageHandler);
     }
@@ -329,10 +351,8 @@ public class TranslationOverlayService extends Service {
                         pendingOcrHits = 0;
                         return;
                     }
-
-                    if (similarEnough(src, pendingOcrSource)) {
-                        pendingOcrHits++;
-                    } else {
+                    if (similarEnough(src, pendingOcrSource)) pendingOcrHits++;
+                    else {
                         pendingOcrSource = src;
                         pendingOcrHits = 1;
                     }
@@ -364,14 +384,12 @@ public class TranslationOverlayService extends Service {
         if (result == null) return "";
         Set<String> lines = new LinkedHashSet<>();
         int totalChars = 0;
-
         outer:
         for (Text.TextBlock block : result.getTextBlocks()) {
             for (Text.Line line : block.getLines()) {
                 String value = normalizeOcrLine(line.getText());
                 if (!isChineseDominantLine(value)) continue;
                 if (!lines.add(value)) continue;
-
                 totalChars += value.length();
                 if (totalChars > 260 || lines.size() >= 6) break outer;
             }
@@ -403,7 +421,6 @@ public class TranslationOverlayService extends Service {
         int han = 0;
         int lettersOrDigits = 0;
         int latinOrDigits = 0;
-
         for (int offset = 0; offset < value.length();) {
             int cp = value.codePointAt(offset);
             offset += Character.charCount(cp);
@@ -415,7 +432,6 @@ public class TranslationOverlayService extends Service {
                 latinOrDigits++;
             }
         }
-
         if (han < 2) return false;
         double ratio = han / (double) Math.max(1, lettersOrDigits);
         if (han < 4 && ratio < 0.30d) return false;
@@ -429,12 +445,10 @@ public class TranslationOverlayService extends Service {
         if (x.isEmpty() || y.isEmpty()) return false;
         if (x.equals(y)) return true;
         if (Math.min(x.length(), y.length()) >= 5 && (x.contains(y) || y.contains(x))) return true;
-
         int max = Math.max(x.length(), y.length());
         if (max > 180) return false;
         int distance = levenshtein(x, y);
-        double similarity = 1.0d - distance / (double) max;
-        return similarity >= 0.82d;
+        return 1.0d - distance / (double) max >= 0.82d;
     }
 
     private String hanOnly(String value) {
@@ -498,8 +512,7 @@ public class TranslationOverlayService extends Service {
                 Math.min(getResources().getDisplayMetrics().widthPixels - dp(28), dp(620)),
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                commonFlags,
-                PixelFormat.TRANSLUCENT);
+                commonFlags, PixelFormat.TRANSLUCENT);
         ocrLp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
         ocrLp.y = dp(52);
 
@@ -507,8 +520,7 @@ public class TranslationOverlayService extends Service {
                 Math.min(getResources().getDisplayMetrics().widthPixels - dp(24), dp(680)),
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                commonFlags,
-                PixelFormat.TRANSLUCENT);
+                commonFlags, PixelFormat.TRANSLUCENT);
         speechLp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
         speechLp.y = dp(72);
 
@@ -516,8 +528,7 @@ public class TranslationOverlayService extends Service {
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                commonFlags,
-                PixelFormat.TRANSLUCENT);
+                commonFlags, PixelFormat.TRANSLUCENT);
         chipLp.gravity = Gravity.TOP | Gravity.END;
         chipLp.x = dp(12);
         chipLp.y = dp(18);
@@ -584,12 +595,12 @@ public class TranslationOverlayService extends Service {
 
     private void startAsForeground(boolean mic) {
         String title = SubtitleSettings.MODE_VIDEO.equals(mode)
-                ? "Перевод видео: Китайский → Русский"
-                : "Перевод трансляции: Китайский → Русский";
+                ? "Точный перевод видео: Китайский → Русский"
+                : "Точный перевод трансляции: Китайский → Русский";
         Notification n = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_menu_info_details)
                 .setContentTitle(title)
-                .setContentText(enableOcr ? "LIVE речь + китайский текст с изображения" : "LIVE перевод речи активен")
+                .setContentText(enableOcr ? "Точный перевод речи + китайский текст" : "Точный перевод речи активен")
                 .setOngoing(true)
                 .setCategory(NotificationCompat.CATEGORY_SERVICE)
                 .build();
@@ -597,9 +608,7 @@ public class TranslationOverlayService extends Service {
             int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
             if (mic) type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
             startForeground(NOTIFICATION_ID, n, type);
-        } else {
-            startForeground(NOTIFICATION_ID, n);
-        }
+        } else startForeground(NOTIFICATION_ID, n);
     }
 
     private void createNotificationChannel() {
@@ -630,17 +639,12 @@ public class TranslationOverlayService extends Service {
 
     private void removeView(android.view.View v) {
         if (windowManager != null && v != null) {
-            try {
-                windowManager.removeView(v);
-            } catch (Exception ignored) { }
+            try { windowManager.removeView(v); } catch (Exception ignored) { }
         }
     }
 
-    @Nullable
-    @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
+    @Nullable @Override
+    public IBinder onBind(Intent intent) { return null; }
 
     private int dp(int v) {
         return Math.round(v * getResources().getDisplayMetrics().density);
