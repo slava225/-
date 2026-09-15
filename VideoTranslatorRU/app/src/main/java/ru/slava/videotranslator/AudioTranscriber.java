@@ -21,6 +21,9 @@ import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 
 public class AudioTranscriber {
+    private static final long PARTIAL_INTERVAL_MS = 420L;
+    private static final long TRANSCRIPT_SILENCE_MS = 850L;
+
     private final Context context;
     private final MediaProjection projection;
     private final boolean useMic;
@@ -39,55 +42,88 @@ public class AudioTranscriber {
     public void start(File modelDir, Consumer<String> onChinese, Consumer<String> onStatus) {
         executor.execute(() -> {
             try {
-                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+                        != PackageManager.PERMISSION_GRANTED) {
                     onStatus.accept("Нет разрешения RECORD_AUDIO");
                     return;
                 }
+
                 model = new Model(modelDir.getAbsolutePath());
                 recognizer = new Recognizer(model, 16000.0f);
                 audioRecord = useMic ? createMicRecord() : createPlaybackRecord();
                 if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
                     throw new IllegalStateException("AudioRecord не инициализирован");
                 }
+
                 running = true;
                 audioRecord.startRecording();
-                onStatus.accept(useMic ? "Слушаю через микрофон…" : "Слушаю системный звук…");
+                onStatus.accept(useMic ? "LIVE • слушаю микрофон" : "LIVE • слушаю системный звук");
 
                 int nativeRate = useMic ? 16000 : 48000;
-                byte[] buffer = new byte[Math.max(4096, AudioRecord.getMinBufferSize(nativeRate,
-                        AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT))];
-                long lastPartial = 0;
+                // Read ~200 ms chunks instead of waiting for a large AudioRecord buffer to fill.
+                // This is the main latency improvement for live subtitles.
+                int chunkBytes = Math.max(3200, (nativeRate / 5) * 2);
+                byte[] buffer = new byte[chunkBytes];
+
+                long lastPartialEmitAt = 0L;
+                long lastTranscriptAt = 0L;
                 long startedAt = System.currentTimeMillis();
                 long lastAudibleAt = startedAt;
                 boolean silenceHintShown = false;
+                boolean transcriptSilenceEmitted = true;
+                String lastEmitted = "";
+
                 while (running) {
                     int n = audioRecord.read(buffer, 0, buffer.length);
                     if (n <= 0) continue;
+                    long now = System.currentTimeMillis();
+
                     if (hasAudibleSignal(buffer, n)) {
-                        lastAudibleAt = System.currentTimeMillis();
+                        lastAudibleAt = now;
                         silenceHintShown = false;
                     } else if (!useMic && !silenceHintShown
-                            && System.currentTimeMillis() - startedAt > 7000
-                            && System.currentTimeMillis() - lastAudibleAt > 7000) {
+                            && now - startedAt > 7000
+                            && now - lastAudibleAt > 7000) {
                         silenceHintShown = true;
                         onStatus.accept("Не слышу системный звук. Если видео уже играет — попробуй режим «Микрофон»");
                     }
+
                     byte[] pcm16 = useMic ? copyOf(buffer, n) : downsample48to16(buffer, n);
                     boolean finalResult = recognizer.acceptWaveForm(pcm16, pcm16.length);
+
                     if (finalResult) {
                         String text = jsonField(recognizer.getResult(), "text");
-                        if (!text.isEmpty()) onChinese.accept(text);
+                        if (!text.isEmpty()) {
+                            lastTranscriptAt = now;
+                            transcriptSilenceEmitted = false;
+                            if (!text.equals(lastEmitted)) {
+                                lastEmitted = text;
+                                onChinese.accept(text);
+                            }
+                        }
                     } else {
-                        long now = System.currentTimeMillis();
-                        if (now - lastPartial > 1200) {
-                            lastPartial = now;
-                            String partial = jsonField(recognizer.getPartialResult(), "partial");
-                            if (partial.length() >= 4) onChinese.accept(partial);
+                        String partial = jsonField(recognizer.getPartialResult(), "partial");
+                        if (!partial.isEmpty()) {
+                            lastTranscriptAt = now;
+                            transcriptSilenceEmitted = false;
+                            if (now - lastPartialEmitAt >= PARTIAL_INTERVAL_MS && !partial.equals(lastEmitted)) {
+                                lastPartialEmitAt = now;
+                                lastEmitted = partial;
+                                onChinese.accept(partial);
+                            }
+                        } else if (lastTranscriptAt > 0
+                                && now - lastTranscriptAt >= TRANSCRIPT_SILENCE_MS
+                                && !transcriptSilenceEmitted) {
+                            // Empty string is a deliberate signal to the overlay: the previous
+                            // subtitle is stale and must disappear instead of sticking on screen.
+                            transcriptSilenceEmitted = true;
+                            lastEmitted = "";
+                            onChinese.accept("");
                         }
                     }
                 }
             } catch (Exception e) {
-                onStatus.accept("Ошибка распознавания речи: " + e.getMessage());
+                onStatus.accept("Ошибка распознавания речи: " + safeMessage(e));
             } finally {
                 release();
             }
@@ -167,19 +203,35 @@ public class AudioTranscriber {
     }
 
     private String jsonField(String json, String key) {
-        try { return new JSONObject(json).optString(key, "").trim(); }
-        catch (Exception e) { return ""; }
+        try {
+            return new JSONObject(json).optString(key, "").trim();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private String safeMessage(Exception e) {
+        String message = e.getMessage();
+        return message == null || message.trim().isEmpty() ? e.getClass().getSimpleName() : message;
     }
 
     public void stop() {
         running = false;
-        try { if (audioRecord != null) audioRecord.stop(); } catch (Exception ignored) { }
+        try {
+            if (audioRecord != null) audioRecord.stop();
+        } catch (Exception ignored) { }
     }
 
     private void release() {
-        try { if (audioRecord != null) audioRecord.release(); } catch (Exception ignored) { }
-        try { if (recognizer != null) recognizer.close(); } catch (Exception ignored) { }
-        try { if (model != null) model.close(); } catch (Exception ignored) { }
+        try {
+            if (audioRecord != null) audioRecord.release();
+        } catch (Exception ignored) { }
+        try {
+            if (recognizer != null) recognizer.close();
+        } catch (Exception ignored) { }
+        try {
+            if (model != null) model.close();
+        } catch (Exception ignored) { }
         audioRecord = null;
         recognizer = null;
         model = null;
