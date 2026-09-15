@@ -31,11 +31,14 @@ import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
 import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.Text;
 import com.google.mlkit.vision.text.TextRecognition;
 import com.google.mlkit.vision.text.TextRecognizer;
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions;
 
 import java.nio.ByteBuffer;
+import java.util.LinkedHashSet;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class TranslationOverlayService extends Service {
@@ -44,6 +47,7 @@ public class TranslationOverlayService extends Service {
     public static final String EXTRA_AUDIO_SOURCE = "audio_source";
     public static final String EXTRA_ENABLE_SPEECH = "enable_speech";
     public static final String EXTRA_ENABLE_OCR = "enable_ocr";
+    public static final String EXTRA_MODE = "app_mode";
     public static final String ACTION_STOP = "ru.slava.videotranslator.STOP";
 
     private static final int NOTIFICATION_ID = 42;
@@ -69,12 +73,15 @@ public class TranslationOverlayService extends Service {
 
     private long lastOcrAt;
     private String lastOcrSource = "";
+    private String pendingOcrSource = "";
+    private int pendingOcrHits = 0;
     private String lastSpeechSource = "";
     private final AtomicBoolean ocrBusy = new AtomicBoolean(false);
     private boolean enableSpeech = true;
-    private boolean enableOcr = true;
+    private boolean enableOcr = false;
     private boolean showOriginal = false;
     private boolean useMic = false;
+    private String mode = SubtitleSettings.MODE_LIVE;
 
     private final Runnable hideSpeech = () -> setCardVisible(speechCard, false);
     private final Runnable hideOcr = () -> setCardVisible(ocrCard, false);
@@ -104,14 +111,15 @@ public class TranslationOverlayService extends Service {
             //noinspection deprecation
             data = intent.getParcelableExtra(EXTRA_RESULT_DATA);
         }
+
+        mode = SubtitleSettings.normalizeMode(intent.getStringExtra(EXTRA_MODE));
         useMic = "mic".equals(intent.getStringExtra(EXTRA_AUDIO_SOURCE));
-        enableSpeech = intent.getBooleanExtra(EXTRA_ENABLE_SPEECH, SubtitleSettings.speechEnabled(this));
-        enableOcr = intent.getBooleanExtra(EXTRA_ENABLE_OCR, SubtitleSettings.ocrEnabled(this));
+        enableSpeech = intent.getBooleanExtra(EXTRA_ENABLE_SPEECH, SubtitleSettings.speechEnabled(this, mode));
+        enableOcr = intent.getBooleanExtra(EXTRA_ENABLE_OCR, SubtitleSettings.ocrEnabled(this, mode));
         showOriginal = SubtitleSettings.showOriginal(this);
 
         startAsForeground(useMic);
 
-        // Activity.RESULT_OK equals -1. v0.1 mistakenly treated -1 as a denied result.
         if (resultCode != Activity.RESULT_OK || data == null) {
             showFatal("Android не передал разрешение на захват экрана. Вернись в приложение и выдай доступ ещё раз.");
             return START_NOT_STICKY;
@@ -122,7 +130,8 @@ public class TranslationOverlayService extends Service {
         }
 
         createOverlay();
-        setStatus(useMic ? "Микрофон" : "Системный звук");
+        setStatus(modeLabel() + " • " + (useMic ? "микрофон" : "системный звук")
+                + (enableOcr ? " • изображение ВКЛ" : " • изображение ВЫКЛ"));
 
         try {
             MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
@@ -135,8 +144,7 @@ public class TranslationOverlayService extends Service {
                 @Override public void onStop() { stopSelf(); }
             }, mainHandler);
 
-            if (enableOcr) startScreenCapture();
-            prepareTranslationAndSpeech();
+            prepareTranslationAndFeatures();
         } catch (SecurityException e) {
             showFatal("Android отклонил захват экрана. На Android 14+ разрешение нужно выдавать заново перед каждым запуском.");
         } catch (Exception e) {
@@ -145,15 +153,27 @@ public class TranslationOverlayService extends Service {
         return START_NOT_STICKY;
     }
 
-    private void prepareTranslationAndSpeech() {
-        setStatus("Готовлю перевод…");
+    private void prepareTranslationAndFeatures() {
+        setStatus(modeLabel() + " • готовлю переводчик…");
         translation.prepare(() -> {
+            // v0.2 started OCR before the translator model was ready. This could lose the first
+            // recognized Chinese frame and then incorrectly treat it as already processed.
+            if (enableOcr) {
+                try {
+                    startScreenCapture();
+                } catch (Exception e) {
+                    enableOcr = false;
+                    setStatus(modeLabel() + " • OCR не запустился: " + safeMessage(e));
+                }
+            }
+
             if (!enableSpeech) {
-                setStatus(enableOcr ? "OCR активен" : "Готово");
+                setStatus(modeLabel() + (enableOcr ? " • китайский текст с изображения" : " • готово"));
                 return;
             }
+
             modelManager.ensureModel(this::setStatus, modelFile -> {
-                setStatus(useMic ? "Слушаю микрофон" : "Слушаю системный звук");
+                setStatus(modeLabel() + " • " + (useMic ? "слушаю микрофон" : "слушаю системный звук"));
                 transcriber = new AudioTranscriber(this, projection, useMic);
                 transcriber.start(modelFile, this::onChineseSpeech, message -> {
                     setStatus(message);
@@ -181,6 +201,8 @@ public class TranslationOverlayService extends Service {
     }
 
     private void startScreenCapture() {
+        if (virtualDisplay != null || projection == null) return;
+
         android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
         int width = dm.widthPixels;
         int height = dm.heightPixels;
@@ -195,7 +217,8 @@ public class TranslationOverlayService extends Service {
                 image = reader.acquireLatestImage();
                 if (image == null) return;
                 long now = System.currentTimeMillis();
-                if (now - lastOcrAt < 1200 || !ocrBusy.compareAndSet(false, true)) return;
+                long interval = SubtitleSettings.MODE_LIVE.equals(mode) ? 750L : 1050L;
+                if (now - lastOcrAt < interval || !ocrBusy.compareAndSet(false, true)) return;
                 lastOcrAt = now;
                 Bitmap bitmap = imageToBitmap(image, width, height);
                 processOcr(bitmap);
@@ -207,7 +230,7 @@ public class TranslationOverlayService extends Service {
         }, imageHandler);
 
         virtualDisplay = projection.createVirtualDisplay(
-                "LiveTranslatorScreen",
+                "ChineseImageTranslator",
                 width, height, density,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 imageReader.getSurface(), null, imageHandler);
@@ -230,19 +253,35 @@ public class TranslationOverlayService extends Service {
         InputImage input = InputImage.fromBitmap(bitmap, 0);
         textRecognizer.process(input)
                 .addOnSuccessListener(result -> {
-                    String src = cleanOcr(result.getText());
-                    if (src.length() > 420) src = src.substring(0, 420);
-                    if (!src.isEmpty() && !similarEnough(src, lastOcrSource)) {
-                        lastOcrSource = src;
-                        final String source = src;
-                        translation.translate(src, ru -> runOnMain(() -> {
-                            String text = showOriginal ? source + "\n" + ru : ru;
-                            ocrText.setText(text);
-                            setCardVisible(ocrCard, true);
-                            mainHandler.removeCallbacks(hideOcr);
-                            mainHandler.postDelayed(hideOcr, 7000);
-                        }));
+                    String src = extractChineseOnly(result);
+                    if (src.isEmpty()) {
+                        pendingOcrSource = "";
+                        pendingOcrHits = 0;
+                        return;
                     }
+
+                    if (similarEnough(src, pendingOcrSource)) {
+                        pendingOcrHits++;
+                    } else {
+                        pendingOcrSource = src;
+                        pendingOcrHits = 1;
+                    }
+
+                    // Live streams are noisy: require the Chinese text to survive two frames.
+                    int requiredHits = SubtitleSettings.MODE_LIVE.equals(mode) ? 2 : 1;
+                    if (pendingOcrHits < requiredHits || similarEnough(src, lastOcrSource)) return;
+
+                    lastOcrSource = src;
+                    pendingOcrHits = 0;
+                    final String source = src;
+                    translation.translate(src, ru -> runOnMain(() -> {
+                        if (ru == null || ru.trim().isEmpty()) return;
+                        String text = showOriginal ? source + "\n" + ru : ru;
+                        ocrText.setText(text);
+                        setCardVisible(ocrCard, true);
+                        mainHandler.removeCallbacks(hideOcr);
+                        mainHandler.postDelayed(hideOcr, 6500);
+                    }));
                 })
                 .addOnCompleteListener(task -> {
                     bitmap.recycle();
@@ -250,24 +289,116 @@ public class TranslationOverlayService extends Service {
                 });
     }
 
-    private String cleanOcr(String raw) {
+    /**
+     * Keeps only lines that are actually Chinese-dominant. The old implementation translated the
+     * complete OCR result as long as a single Han character existed anywhere on screen, so Latin
+     * UI labels, numbers and unrelated app chrome polluted the translation.
+     */
+    private String extractChineseOnly(Text result) {
+        if (result == null) return "";
+        Set<String> lines = new LinkedHashSet<>();
+        int totalChars = 0;
+
+        outer:
+        for (Text.TextBlock block : result.getTextBlocks()) {
+            for (Text.Line line : block.getLines()) {
+                String value = normalizeOcrLine(line.getText());
+                if (!isChineseDominantLine(value)) continue;
+                if (!lines.add(value)) continue;
+
+                totalChars += value.length();
+                if (totalChars > 260 || lines.size() >= 6) break outer;
+            }
+        }
+
+        StringBuilder out = new StringBuilder();
+        for (String line : lines) {
+            if (out.length() > 0) out.append('\n');
+            if (out.length() + line.length() > 260) {
+                int remain = 260 - out.length();
+                if (remain > 0) out.append(line, 0, Math.min(remain, line.length()));
+                break;
+            }
+            out.append(line);
+        }
+        return out.toString().trim();
+    }
+
+    private String normalizeOcrLine(String raw) {
         if (raw == null) return "";
-        String text = raw.replaceAll("[\\t ]+", " ")
-                .replaceAll("\\n{3,}", "\n\n")
+        return raw.replaceAll("https?://\\S+", "")
+                .replaceAll("www\\.\\S+", "")
+                .replaceAll("[\\t\\r ]+", " ")
                 .trim();
-        if (text.length() < 2) return "";
-        if (!text.matches("(?s).*\\p{IsHan}.*")) return "";
-        return text;
+    }
+
+    private boolean isChineseDominantLine(String value) {
+        if (value == null || value.length() < 2) return false;
+        int han = 0;
+        int lettersOrDigits = 0;
+        int latinOrDigits = 0;
+
+        for (int offset = 0; offset < value.length();) {
+            int cp = value.codePointAt(offset);
+            offset += Character.charCount(cp);
+            boolean isHan = Character.UnicodeScript.of(cp) == Character.UnicodeScript.HAN;
+            if (isHan) {
+                han++;
+                lettersOrDigits++;
+            } else if (Character.isLetterOrDigit(cp)) {
+                lettersOrDigits++;
+                latinOrDigits++;
+            }
+        }
+
+        if (han < 2) return false;
+        double ratio = han / (double) Math.max(1, lettersOrDigits);
+        if (han < 4 && ratio < 0.30d) return false;
+        return latinOrDigits <= han * 3 || han >= 5;
     }
 
     private boolean similarEnough(String a, String b) {
-        if (b == null || b.isEmpty()) return false;
-        if (a.equals(b)) return true;
-        int min = Math.min(a.length(), b.length());
-        if (min < 8) return false;
-        int same = 0;
-        for (int i = 0; i < min; i++) if (a.charAt(i) == b.charAt(i)) same++;
-        return same >= min * 0.86;
+        if (a == null || b == null || a.isEmpty() || b.isEmpty()) return false;
+        String x = hanOnly(a);
+        String y = hanOnly(b);
+        if (x.isEmpty() || y.isEmpty()) return false;
+        if (x.equals(y)) return true;
+        if (Math.min(x.length(), y.length()) >= 5 && (x.contains(y) || y.contains(x))) return true;
+
+        int max = Math.max(x.length(), y.length());
+        if (max > 180) return false;
+        int distance = levenshtein(x, y);
+        double similarity = 1.0d - distance / (double) max;
+        return similarity >= 0.82d;
+    }
+
+    private String hanOnly(String value) {
+        StringBuilder out = new StringBuilder();
+        for (int offset = 0; offset < value.length();) {
+            int cp = value.codePointAt(offset);
+            offset += Character.charCount(cp);
+            if (Character.UnicodeScript.of(cp) == Character.UnicodeScript.HAN) {
+                out.appendCodePoint(cp);
+            }
+        }
+        return out.toString();
+    }
+
+    private int levenshtein(String a, String b) {
+        int[] prev = new int[b.length() + 1];
+        int[] cur = new int[b.length() + 1];
+        for (int j = 0; j <= b.length(); j++) prev[j] = j;
+        for (int i = 1; i <= a.length(); i++) {
+            cur[0] = i;
+            for (int j = 1; j <= b.length(); j++) {
+                int cost = a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1;
+                cur[j] = Math.min(Math.min(cur[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost);
+            }
+            int[] swap = prev;
+            prev = cur;
+            cur = swap;
+        }
+        return prev[b.length()];
     }
 
     private void createOverlay() {
@@ -277,7 +408,7 @@ public class TranslationOverlayService extends Service {
 
         ocrCard = overlayCard(bg, 16);
         ocrText = overlayText(SubtitleSettings.ocrSize(this), Gravity.START);
-        ocrText.setMaxLines(5);
+        ocrText.setMaxLines(7);
         ocrCard.addView(ocrText, new LinearLayout.LayoutParams(-1, -2));
         setCardVisible(ocrCard, false);
 
@@ -307,7 +438,7 @@ public class TranslationOverlayService extends Service {
                 commonFlags,
                 PixelFormat.TRANSLUCENT);
         ocrLp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-        ocrLp.y = dp(48);
+        ocrLp.y = dp(52);
 
         WindowManager.LayoutParams speechLp = new WindowManager.LayoutParams(
                 Math.min(getResources().getDisplayMetrics().widthPixels - dp(24), dp(680)),
@@ -371,8 +502,12 @@ public class TranslationOverlayService extends Service {
 
     private void setStatus(String text) {
         runOnMain(() -> {
-            if (statusChip != null) statusChip.setText(text == null ? "LIVE" : text);
+            if (statusChip != null) statusChip.setText(text == null ? modeLabel() : text);
         });
+    }
+
+    private String modeLabel() {
+        return SubtitleSettings.MODE_VIDEO.equals(mode) ? "ВИДЕО" : "ЭФИР";
     }
 
     private String safeMessage(Exception e) {
@@ -385,10 +520,13 @@ public class TranslationOverlayService extends Service {
     }
 
     private void startAsForeground(boolean mic) {
+        String title = SubtitleSettings.MODE_VIDEO.equals(mode)
+                ? "Перевод видео: Китайский → Русский"
+                : "Перевод трансляции: Китайский → Русский";
         Notification n = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_menu_info_details)
-                .setContentTitle("Китайский → Русский LIVE")
-                .setContentText("Перевод речи и текста с экрана активен")
+                .setContentTitle(title)
+                .setContentText(enableOcr ? "Речь + китайский текст с изображения" : "Перевод речи активен")
                 .setOngoing(true)
                 .setCategory(NotificationCompat.CATEGORY_SERVICE)
                 .build();
