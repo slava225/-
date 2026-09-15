@@ -11,6 +11,7 @@ import android.media.projection.MediaProjection;
 
 import androidx.core.content.ContextCompat;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.vosk.Model;
 import org.vosk.Recognizer;
@@ -21,8 +22,24 @@ import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 
 public class AudioTranscriber {
-    private static final long PARTIAL_INTERVAL_MS = 420L;
-    private static final long TRANSCRIPT_SILENCE_MS = 850L;
+    private static final long PARTIAL_INTERVAL_MS = 520L;
+    private static final long TRANSCRIPT_SILENCE_MS = 900L;
+
+    public static final class Transcript {
+        public final String text;
+        public final boolean isFinal;
+        public final float confidence;
+
+        Transcript(String text, boolean isFinal, float confidence) {
+            this.text = text == null ? "" : text;
+            this.isFinal = isFinal;
+            this.confidence = confidence;
+        }
+    }
+
+    public interface TranscriptListener {
+        void onTranscript(Transcript transcript);
+    }
 
     private final Context context;
     private final MediaProjection projection;
@@ -39,7 +56,7 @@ public class AudioTranscriber {
         this.useMic = useMic;
     }
 
-    public void start(File modelDir, Consumer<String> onChinese, Consumer<String> onStatus) {
+    public void start(File modelDir, TranscriptListener onTranscript, Consumer<String> onStatus) {
         executor.execute(() -> {
             try {
                 if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
@@ -50,6 +67,9 @@ public class AudioTranscriber {
 
                 model = new Model(modelDir.getAbsolutePath());
                 recognizer = new Recognizer(model, 16000.0f);
+                recognizer.setWords(true);
+                recognizer.setPartialWords(true);
+
                 audioRecord = useMic ? createMicRecord() : createPlaybackRecord();
                 if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
                     throw new IllegalStateException("AudioRecord не инициализирован");
@@ -57,12 +77,10 @@ public class AudioTranscriber {
 
                 running = true;
                 audioRecord.startRecording();
-                onStatus.accept(useMic ? "LIVE • слушаю микрофон" : "LIVE • слушаю системный звук");
+                onStatus.accept(useMic ? "ТОЧНО • слушаю микрофон" : "ТОЧНО • слушаю системный звук");
 
                 int nativeRate = useMic ? 16000 : 48000;
-                // Read ~200 ms chunks instead of waiting for a large AudioRecord buffer to fill.
-                // This is the main latency improvement for live subtitles.
-                int chunkBytes = Math.max(3200, (nativeRate / 5) * 2);
+                int chunkBytes = Math.max(3200, (nativeRate / 5) * 2); // ~200 ms
                 byte[] buffer = new byte[chunkBytes];
 
                 long lastPartialEmitAt = 0L;
@@ -72,6 +90,8 @@ public class AudioTranscriber {
                 boolean silenceHintShown = false;
                 boolean transcriptSilenceEmitted = true;
                 String lastEmitted = "";
+                String previousPartial = "";
+                int stablePartialHits = 0;
 
                 while (running) {
                     int n = audioRecord.read(buffer, 0, buffer.length);
@@ -92,33 +112,51 @@ public class AudioTranscriber {
                     boolean finalResult = recognizer.acceptWaveForm(pcm16, pcm16.length);
 
                     if (finalResult) {
-                        String text = jsonField(recognizer.getResult(), "text");
+                        String json = recognizer.getResult();
+                        String text = jsonField(json, "text");
+                        float confidence = averageConfidence(json, "result");
+                        previousPartial = "";
+                        stablePartialHits = 0;
+
                         if (!text.isEmpty()) {
                             lastTranscriptAt = now;
                             transcriptSilenceEmitted = false;
-                            if (!text.equals(lastEmitted)) {
-                                lastEmitted = text;
-                                onChinese.accept(text);
-                            }
+                            lastEmitted = text;
+                            onTranscript.onTranscript(new Transcript(text, true, confidence));
                         }
                     } else {
-                        String partial = jsonField(recognizer.getPartialResult(), "partial");
+                        String json = recognizer.getPartialResult();
+                        String partial = jsonField(json, "partial");
+                        float confidence = averageConfidence(json, "partial_result");
+
                         if (!partial.isEmpty()) {
                             lastTranscriptAt = now;
                             transcriptSilenceEmitted = false;
-                            if (now - lastPartialEmitAt >= PARTIAL_INTERVAL_MS && !partial.equals(lastEmitted)) {
+
+                            if (isStableProgress(previousPartial, partial)) {
+                                stablePartialHits++;
+                            } else {
+                                stablePartialHits = 1;
+                            }
+                            previousPartial = partial;
+
+                            boolean confidenceOk = confidence <= 0f || confidence >= 0.38f;
+                            if (stablePartialHits >= 2
+                                    && confidenceOk
+                                    && now - lastPartialEmitAt >= PARTIAL_INTERVAL_MS
+                                    && !partial.equals(lastEmitted)) {
                                 lastPartialEmitAt = now;
                                 lastEmitted = partial;
-                                onChinese.accept(partial);
+                                onTranscript.onTranscript(new Transcript(partial, false, confidence));
                             }
                         } else if (lastTranscriptAt > 0
                                 && now - lastTranscriptAt >= TRANSCRIPT_SILENCE_MS
                                 && !transcriptSilenceEmitted) {
-                            // Empty string is a deliberate signal to the overlay: the previous
-                            // subtitle is stale and must disappear instead of sticking on screen.
                             transcriptSilenceEmitted = true;
                             lastEmitted = "";
-                            onChinese.accept("");
+                            previousPartial = "";
+                            stablePartialHits = 0;
+                            onTranscript.onTranscript(new Transcript("", true, 1f));
                         }
                     }
                 }
@@ -128,6 +166,38 @@ public class AudioTranscriber {
                 release();
             }
         });
+    }
+
+    private boolean isStableProgress(String previous, String current) {
+        if (previous == null || previous.isEmpty()) return false;
+        if (previous.equals(current)) return true;
+        if (current.startsWith(previous) || previous.startsWith(current)) return true;
+        int min = Math.min(previous.length(), current.length());
+        if (min < 3) return false;
+        int same = 0;
+        for (int i = 0; i < min; i++) {
+            if (previous.charAt(i) == current.charAt(i)) same++;
+            else break;
+        }
+        return same >= Math.max(3, (int) (min * 0.72f));
+    }
+
+    private float averageConfidence(String json, String arrayKey) {
+        try {
+            JSONArray words = new JSONObject(json).optJSONArray(arrayKey);
+            if (words == null || words.length() == 0) return 0f;
+            float total = 0f;
+            int count = 0;
+            for (int i = 0; i < words.length(); i++) {
+                JSONObject word = words.optJSONObject(i);
+                if (word == null || !word.has("conf")) continue;
+                total += (float) word.optDouble("conf", 0.0);
+                count++;
+            }
+            return count == 0 ? 0f : total / count;
+        } catch (Exception e) {
+            return 0f;
+        }
     }
 
     private AudioRecord createPlaybackRecord() {
@@ -167,9 +237,8 @@ public class AudioTranscriber {
     }
 
     private boolean hasAudibleSignal(byte[] data, int len) {
-        int step = 16;
         int max = 0;
-        for (int i = 0; i + 1 < len; i += step) {
+        for (int i = 0; i + 1 < len; i += 16) {
             int sample = Math.abs(shortAt(data, i));
             if (sample > max) max = sample;
             if (max > 220) return true;
