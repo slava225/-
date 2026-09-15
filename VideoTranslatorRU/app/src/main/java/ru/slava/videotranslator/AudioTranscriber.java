@@ -56,19 +56,17 @@ public class AudioTranscriber {
         this.useMic = useMic;
     }
 
-    /** Compatibility entry point used by the overlay. It now applies accuracy filtering. */
+    /** Compatibility entry point used by older call sites. It now applies accuracy filtering. */
     public void start(File modelDir, Consumer<String> onChinese, Consumer<String> onStatus) {
-        start(modelDir, transcript -> {
+        start(modelDir, (TranscriptListener) transcript -> {
             if (transcript.text.isEmpty()) {
                 onChinese.accept("");
                 return;
             }
             float conf = transcript.confidence;
             if (transcript.isFinal) {
-                // Keep strong final hypotheses. If Vosk did not expose confidence, keep it too.
                 if (conf <= 0f || conf >= 0.40f) onChinese.accept(transcript.text);
             } else {
-                // Partial speech is much noisier, so require higher confidence.
                 if (conf <= 0f || conf >= 0.50f) onChinese.accept(transcript.text);
             }
         }, onStatus);
