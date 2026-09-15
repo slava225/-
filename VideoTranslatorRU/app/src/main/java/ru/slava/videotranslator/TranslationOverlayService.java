@@ -1,5 +1,6 @@
 package ru.slava.videotranslator;
 
+import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -9,6 +10,7 @@ import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
+import android.graphics.drawable.GradientDrawable;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.media.Image;
@@ -40,36 +42,47 @@ public class TranslationOverlayService extends Service {
     public static final String EXTRA_RESULT_CODE = "result_code";
     public static final String EXTRA_RESULT_DATA = "result_data";
     public static final String EXTRA_AUDIO_SOURCE = "audio_source";
+    public static final String EXTRA_ENABLE_SPEECH = "enable_speech";
+    public static final String EXTRA_ENABLE_OCR = "enable_ocr";
     public static final String ACTION_STOP = "ru.slava.videotranslator.STOP";
 
     private static final int NOTIFICATION_ID = 42;
     private static final String CHANNEL_ID = "translator_live";
 
     private WindowManager windowManager;
-    private LinearLayout overlay;
-    private TextView screenText;
+    private LinearLayout speechCard;
+    private LinearLayout ocrCard;
     private TextView speechText;
-    private TextView miniStatus;
+    private TextView ocrText;
+    private TextView statusChip;
 
     private MediaProjection projection;
     private VirtualDisplay virtualDisplay;
     private ImageReader imageReader;
     private HandlerThread imageThread;
     private Handler imageHandler;
+    private final Handler mainHandler = new Handler(android.os.Looper.getMainLooper());
     private TextRecognizer textRecognizer;
     private TranslationEngine translation;
     private VoskModelManager modelManager;
     private AudioTranscriber transcriber;
+
     private long lastOcrAt;
     private String lastOcrSource = "";
     private String lastSpeechSource = "";
     private final AtomicBoolean ocrBusy = new AtomicBoolean(false);
+    private boolean enableSpeech = true;
+    private boolean enableOcr = true;
+    private boolean showOriginal = false;
+    private boolean useMic = false;
+
+    private final Runnable hideSpeech = () -> setCardVisible(speechCard, false);
+    private final Runnable hideOcr = () -> setCardVisible(ocrCard, false);
 
     @Override
     public void onCreate() {
         super.onCreate();
         createNotificationChannel();
-        createOverlay();
         translation = new TranslationEngine(this);
         modelManager = new VoskModelManager(this);
         textRecognizer = TextRecognition.getClient(new ChineseTextRecognizerOptions.Builder().build());
@@ -81,52 +94,90 @@ public class TranslationOverlayService extends Service {
             stopSelf();
             return START_NOT_STICKY;
         }
-        startAsForeground(false);
         if (intent == null) return START_NOT_STICKY;
-        int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1);
+
+        int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED);
         Intent data;
         if (Build.VERSION.SDK_INT >= 33) {
             data = intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent.class);
         } else {
+            //noinspection deprecation
             data = intent.getParcelableExtra(EXTRA_RESULT_DATA);
         }
-        if (resultCode == -1 || data == null) {
-            setStatus("Нет разрешения на захват экрана");
+        useMic = "mic".equals(intent.getStringExtra(EXTRA_AUDIO_SOURCE));
+        enableSpeech = intent.getBooleanExtra(EXTRA_ENABLE_SPEECH, SubtitleSettings.speechEnabled(this));
+        enableOcr = intent.getBooleanExtra(EXTRA_ENABLE_OCR, SubtitleSettings.ocrEnabled(this));
+        showOriginal = SubtitleSettings.showOriginal(this);
+
+        startAsForeground(useMic);
+
+        // Activity.RESULT_OK equals -1. v0.1 mistakenly treated -1 as a denied result.
+        if (resultCode != Activity.RESULT_OK || data == null) {
+            showFatal("Android не передал разрешение на захват экрана. Вернись в приложение и выдай доступ ещё раз.");
             return START_NOT_STICKY;
         }
-        boolean useMic = "mic".equals(intent.getStringExtra(EXTRA_AUDIO_SOURCE));
-        if (useMic) startAsForeground(true);
+        if (!Settings.canDrawOverlays(this)) {
+            showFatal("Нет разрешения на показ субтитров поверх других приложений.");
+            return START_NOT_STICKY;
+        }
+
+        createOverlay();
+        setStatus(useMic ? "Микрофон" : "Системный звук");
 
         try {
             MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
             projection = mpm.getMediaProjection(resultCode, data);
+            if (projection == null) {
+                showFatal("Не удалось получить MediaProjection. Выдай доступ к экрану ещё раз.");
+                return START_NOT_STICKY;
+            }
             projection.registerCallback(new MediaProjection.Callback() {
                 @Override public void onStop() { stopSelf(); }
-            }, new Handler(getMainLooper()));
-            startScreenCapture();
-            prepareTranslationAndSpeech(useMic);
+            }, mainHandler);
+
+            if (enableOcr) startScreenCapture();
+            prepareTranslationAndSpeech();
+        } catch (SecurityException e) {
+            showFatal("Android отклонил захват экрана. На Android 14+ разрешение нужно выдавать заново перед каждым запуском.");
         } catch (Exception e) {
-            setStatus("Ошибка запуска: " + e.getMessage());
+            showFatal("Ошибка запуска: " + safeMessage(e));
         }
         return START_NOT_STICKY;
     }
 
-    private void prepareTranslationAndSpeech(boolean useMic) {
-        setStatus("Готовлю переводчик…");
+    private void prepareTranslationAndSpeech() {
+        setStatus("Готовлю перевод…");
         translation.prepare(() -> {
-            setStatus("Модель перевода готова");
+            if (!enableSpeech) {
+                setStatus(enableOcr ? "OCR активен" : "Готово");
+                return;
+            }
             modelManager.ensureModel(this::setStatus, modelFile -> {
-                setStatus("Модель речи готова");
+                setStatus(useMic ? "Слушаю микрофон" : "Слушаю системный звук");
                 transcriber = new AudioTranscriber(this, projection, useMic);
-                transcriber.start(modelFile, this::onChineseSpeech, this::setStatus);
-            }, e -> setStatus("Не удалось скачать модель речи: " + e.getMessage()));
-        }, e -> setStatus("Не удалось скачать модель перевода: " + e.getMessage()));
+                transcriber.start(modelFile, this::onChineseSpeech, message -> {
+                    setStatus(message);
+                    if (message != null && message.startsWith("Ошибка распознавания речи") && !useMic) {
+                        setStatus("Системный звук недоступен — попробуй режим «Микрофон»");
+                    }
+                });
+            }, e -> setStatus("Не удалось скачать модель речи: " + safeMessage(e)));
+        }, e -> setStatus("Не удалось скачать модель перевода: " + safeMessage(e)));
     }
 
     private void onChineseSpeech(String chinese) {
-        if (chinese.equals(lastSpeechSource)) return;
+        if (!enableSpeech || chinese == null) return;
+        chinese = chinese.trim();
+        if (chinese.length() < 2 || chinese.equals(lastSpeechSource)) return;
         lastSpeechSource = chinese;
-        translation.translate(chinese, ru -> runOnMain(() -> speechText.setText(ru)));
+        final String source = chinese;
+        translation.translate(chinese, ru -> runOnMain(() -> {
+            String text = showOriginal ? source + "\n" + ru : ru;
+            speechText.setText(text);
+            setCardVisible(speechCard, true);
+            mainHandler.removeCallbacks(hideSpeech);
+            mainHandler.postDelayed(hideSpeech, 6500);
+        }));
     }
 
     private void startScreenCapture() {
@@ -144,7 +195,7 @@ public class TranslationOverlayService extends Service {
                 image = reader.acquireLatestImage();
                 if (image == null) return;
                 long now = System.currentTimeMillis();
-                if (now - lastOcrAt < 900 || !ocrBusy.compareAndSet(false, true)) return;
+                if (now - lastOcrAt < 1200 || !ocrBusy.compareAndSet(false, true)) return;
                 lastOcrAt = now;
                 Bitmap bitmap = imageToBitmap(image, width, height);
                 processOcr(bitmap);
@@ -179,11 +230,18 @@ public class TranslationOverlayService extends Service {
         InputImage input = InputImage.fromBitmap(bitmap, 0);
         textRecognizer.process(input)
                 .addOnSuccessListener(result -> {
-                    String src = result.getText().trim();
-                    if (src.length() > 500) src = src.substring(0, 500);
-                    if (!src.isEmpty() && !src.equals(lastOcrSource)) {
+                    String src = cleanOcr(result.getText());
+                    if (src.length() > 420) src = src.substring(0, 420);
+                    if (!src.isEmpty() && !similarEnough(src, lastOcrSource)) {
                         lastOcrSource = src;
-                        translation.translate(src, ru -> runOnMain(() -> screenText.setText(ru)));
+                        final String source = src;
+                        translation.translate(src, ru -> runOnMain(() -> {
+                            String text = showOriginal ? source + "\n" + ru : ru;
+                            ocrText.setText(text);
+                            setCardVisible(ocrCard, true);
+                            mainHandler.removeCallbacks(hideOcr);
+                            mainHandler.postDelayed(hideOcr, 7000);
+                        }));
                     }
                 })
                 .addOnCompleteListener(task -> {
@@ -192,57 +250,138 @@ public class TranslationOverlayService extends Service {
                 });
     }
 
+    private String cleanOcr(String raw) {
+        if (raw == null) return "";
+        String text = raw.replaceAll("[\\t ]+", " ")
+                .replaceAll("\\n{3,}", "\n\n")
+                .trim();
+        if (text.length() < 2) return "";
+        if (!text.matches("(?s).*\\p{IsHan}.*")) return "";
+        return text;
+    }
+
+    private boolean similarEnough(String a, String b) {
+        if (b == null || b.isEmpty()) return false;
+        if (a.equals(b)) return true;
+        int min = Math.min(a.length(), b.length());
+        if (min < 8) return false;
+        int same = 0;
+        for (int i = 0; i < min; i++) if (a.charAt(i) == b.charAt(i)) same++;
+        return same >= min * 0.86;
+    }
+
     private void createOverlay() {
-        if (!Settings.canDrawOverlays(this)) return;
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-        overlay = new LinearLayout(this);
-        overlay.setOrientation(LinearLayout.VERTICAL);
-        overlay.setPadding(dp(12), dp(8), dp(12), dp(8));
-        overlay.setBackgroundColor(0x33000000);
+        int alpha = Math.max(35, Math.min(90, SubtitleSettings.backgroundAlpha(this)));
+        int bg = (alpha * 255 / 100 << 24) | 0x0010141d;
 
-        screenText = overlayText(15);
-        speechText = overlayText(22);
-        speechText.setGravity(Gravity.CENTER);
-        miniStatus = overlayText(12);
-        miniStatus.setTextColor(0xffdddddd);
-        miniStatus.setGravity(Gravity.END);
+        ocrCard = overlayCard(bg, 16);
+        ocrText = overlayText(SubtitleSettings.ocrSize(this), Gravity.START);
+        ocrText.setMaxLines(5);
+        ocrCard.addView(ocrText, new LinearLayout.LayoutParams(-1, -2));
+        setCardVisible(ocrCard, false);
 
-        overlay.addView(screenText, new LinearLayout.LayoutParams(-1, -2));
-        LinearLayout.LayoutParams spacer = new LinearLayout.LayoutParams(-1, 0, 1f);
-        overlay.addView(new TextView(this), spacer);
-        overlay.addView(speechText, new LinearLayout.LayoutParams(-1, -2));
-        overlay.addView(miniStatus, new LinearLayout.LayoutParams(-1, -2));
+        speechCard = overlayCard(bg, 20);
+        speechText = overlayText(SubtitleSettings.speechSize(this), Gravity.CENTER);
+        speechText.setTypeface(speechText.getTypeface(), android.graphics.Typeface.BOLD);
+        speechText.setMaxLines(4);
+        speechCard.addView(speechText, new LinearLayout.LayoutParams(-1, -2));
+        setCardVisible(speechCard, false);
 
-        int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        statusChip = new TextView(this);
+        statusChip.setTextColor(0xffd9e5ff);
+        statusChip.setTextSize(11);
+        statusChip.setGravity(Gravity.CENTER);
+        statusChip.setPadding(dp(10), dp(5), dp(10), dp(5));
+        statusChip.setBackground(rounded(0xcc111827, 99, 0xff344361));
+
+        int commonFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                 | WindowManager.LayoutParams.FLAG_SECURE;
-        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
+
+        WindowManager.LayoutParams ocrLp = new WindowManager.LayoutParams(
+                Math.min(getResources().getDisplayMetrics().widthPixels - dp(28), dp(620)),
+                WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                flags,
+                commonFlags,
                 PixelFormat.TRANSLUCENT);
-        lp.gravity = Gravity.TOP | Gravity.START;
-        windowManager.addView(overlay, lp);
+        ocrLp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        ocrLp.y = dp(48);
+
+        WindowManager.LayoutParams speechLp = new WindowManager.LayoutParams(
+                Math.min(getResources().getDisplayMetrics().widthPixels - dp(24), dp(680)),
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                commonFlags,
+                PixelFormat.TRANSLUCENT);
+        speechLp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        speechLp.y = dp(72);
+
+        WindowManager.LayoutParams chipLp = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                commonFlags,
+                PixelFormat.TRANSLUCENT);
+        chipLp.gravity = Gravity.TOP | Gravity.END;
+        chipLp.x = dp(12);
+        chipLp.y = dp(18);
+
+        windowManager.addView(ocrCard, ocrLp);
+        windowManager.addView(speechCard, speechLp);
+        windowManager.addView(statusChip, chipLp);
     }
 
-    private TextView overlayText(int sp) {
+    private LinearLayout overlayCard(int backgroundColor, int radius) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(14), dp(10), dp(14), dp(10));
+        card.setBackground(rounded(backgroundColor, radius, 0x55ffffff));
+        card.setElevation(dp(6));
+        return card;
+    }
+
+    private TextView overlayText(int sp, int gravity) {
         TextView tv = new TextView(this);
         tv.setTextSize(sp);
         tv.setTextColor(Color.WHITE);
-        tv.setShadowLayer(5f, 1f, 1f, Color.BLACK);
-        tv.setPadding(dp(8), dp(6), dp(8), dp(6));
-        tv.setBackgroundColor(0x66000000);
+        tv.setGravity(gravity);
+        tv.setShadowLayer(4f, 0f, 2f, Color.BLACK);
+        tv.setLineSpacing(0f, 1.08f);
         return tv;
     }
 
+    private GradientDrawable rounded(int fill, int radiusDp, int stroke) {
+        GradientDrawable gd = new GradientDrawable();
+        gd.setColor(fill);
+        gd.setCornerRadius(dp(radiusDp));
+        gd.setStroke(dp(1), stroke);
+        return gd;
+    }
+
+    private void setCardVisible(android.view.View view, boolean visible) {
+        if (view != null) view.setVisibility(visible ? android.view.View.VISIBLE : android.view.View.GONE);
+    }
+
+    private void showFatal(String text) {
+        setStatus(text);
+        mainHandler.postDelayed(this::stopSelf, 3500);
+    }
+
     private void setStatus(String text) {
-        runOnMain(() -> { if (miniStatus != null) miniStatus.setText(text); });
+        runOnMain(() -> {
+            if (statusChip != null) statusChip.setText(text == null ? "LIVE" : text);
+        });
+    }
+
+    private String safeMessage(Exception e) {
+        String m = e.getMessage();
+        return (m == null || m.trim().isEmpty()) ? e.getClass().getSimpleName() : m;
     }
 
     private void runOnMain(Runnable r) {
-        new Handler(getMainLooper()).post(r);
+        mainHandler.post(r);
     }
 
     private void startAsForeground(boolean mic) {
@@ -271,6 +410,8 @@ public class TranslationOverlayService extends Service {
 
     @Override
     public void onDestroy() {
+        mainHandler.removeCallbacks(hideSpeech);
+        mainHandler.removeCallbacks(hideOcr);
         if (transcriber != null) transcriber.stop();
         if (virtualDisplay != null) virtualDisplay.release();
         if (imageReader != null) imageReader.close();
@@ -278,10 +419,16 @@ public class TranslationOverlayService extends Service {
         if (textRecognizer != null) textRecognizer.close();
         if (translation != null) translation.close();
         if (imageThread != null) imageThread.quitSafely();
-        if (windowManager != null && overlay != null) {
-            try { windowManager.removeView(overlay); } catch (Exception ignored) { }
-        }
+        removeView(ocrCard);
+        removeView(speechCard);
+        removeView(statusChip);
         super.onDestroy();
+    }
+
+    private void removeView(android.view.View v) {
+        if (windowManager != null && v != null) {
+            try { windowManager.removeView(v); } catch (Exception ignored) { }
+        }
     }
 
     @Nullable @Override
