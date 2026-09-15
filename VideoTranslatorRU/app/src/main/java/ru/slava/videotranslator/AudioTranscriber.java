@@ -46,7 +46,9 @@ public class AudioTranscriber {
                 model = new Model(modelDir.getAbsolutePath());
                 recognizer = new Recognizer(model, 16000.0f);
                 audioRecord = useMic ? createMicRecord() : createPlaybackRecord();
-                if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) throw new IllegalStateException("AudioRecord не инициализирован");
+                if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
+                    throw new IllegalStateException("AudioRecord не инициализирован");
+                }
                 running = true;
                 audioRecord.startRecording();
                 onStatus.accept(useMic ? "Слушаю через микрофон…" : "Слушаю системный звук…");
@@ -55,9 +57,21 @@ public class AudioTranscriber {
                 byte[] buffer = new byte[Math.max(4096, AudioRecord.getMinBufferSize(nativeRate,
                         AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT))];
                 long lastPartial = 0;
+                long startedAt = System.currentTimeMillis();
+                long lastAudibleAt = startedAt;
+                boolean silenceHintShown = false;
                 while (running) {
                     int n = audioRecord.read(buffer, 0, buffer.length);
                     if (n <= 0) continue;
+                    if (hasAudibleSignal(buffer, n)) {
+                        lastAudibleAt = System.currentTimeMillis();
+                        silenceHintShown = false;
+                    } else if (!useMic && !silenceHintShown
+                            && System.currentTimeMillis() - startedAt > 7000
+                            && System.currentTimeMillis() - lastAudibleAt > 7000) {
+                        silenceHintShown = true;
+                        onStatus.accept("Не слышу системный звук. Если видео уже играет — попробуй режим «Микрофон»");
+                    }
                     byte[] pcm16 = useMic ? copyOf(buffer, n) : downsample48to16(buffer, n);
                     boolean finalResult = recognizer.acceptWaveForm(pcm16, pcm16.length);
                     if (finalResult) {
@@ -74,7 +88,9 @@ public class AudioTranscriber {
                 }
             } catch (Exception e) {
                 onStatus.accept("Ошибка распознавания речи: " + e.getMessage());
-            } finally { release(); }
+            } finally {
+                release();
+            }
         });
     }
 
@@ -112,6 +128,17 @@ public class AudioTranscriber {
                 .setAudioFormat(format)
                 .setBufferSizeInBytes(min)
                 .build();
+    }
+
+    private boolean hasAudibleSignal(byte[] data, int len) {
+        int step = 16;
+        int max = 0;
+        for (int i = 0; i + 1 < len; i += step) {
+            int sample = Math.abs(shortAt(data, i));
+            if (sample > max) max = sample;
+            if (max > 220) return true;
+        }
+        return false;
     }
 
     private byte[] downsample48to16(byte[] in, int len) {
