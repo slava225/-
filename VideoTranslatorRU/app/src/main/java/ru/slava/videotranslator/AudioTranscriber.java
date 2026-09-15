@@ -56,6 +56,24 @@ public class AudioTranscriber {
         this.useMic = useMic;
     }
 
+    /** Compatibility entry point used by the overlay. It now applies accuracy filtering. */
+    public void start(File modelDir, Consumer<String> onChinese, Consumer<String> onStatus) {
+        start(modelDir, transcript -> {
+            if (transcript.text.isEmpty()) {
+                onChinese.accept("");
+                return;
+            }
+            float conf = transcript.confidence;
+            if (transcript.isFinal) {
+                // Keep strong final hypotheses. If Vosk did not expose confidence, keep it too.
+                if (conf <= 0f || conf >= 0.40f) onChinese.accept(transcript.text);
+            } else {
+                // Partial speech is much noisier, so require higher confidence.
+                if (conf <= 0f || conf >= 0.50f) onChinese.accept(transcript.text);
+            }
+        }, onStatus);
+    }
+
     public void start(File modelDir, TranscriptListener onTranscript, Consumer<String> onStatus) {
         executor.execute(() -> {
             try {
@@ -80,7 +98,7 @@ public class AudioTranscriber {
                 onStatus.accept(useMic ? "ТОЧНО • слушаю микрофон" : "ТОЧНО • слушаю системный звук");
 
                 int nativeRate = useMic ? 16000 : 48000;
-                int chunkBytes = Math.max(3200, (nativeRate / 5) * 2); // ~200 ms
+                int chunkBytes = Math.max(3200, (nativeRate / 5) * 2);
                 byte[] buffer = new byte[chunkBytes];
 
                 long lastPartialEmitAt = 0L;
@@ -133,11 +151,8 @@ public class AudioTranscriber {
                             lastTranscriptAt = now;
                             transcriptSilenceEmitted = false;
 
-                            if (isStableProgress(previousPartial, partial)) {
-                                stablePartialHits++;
-                            } else {
-                                stablePartialHits = 1;
-                            }
+                            if (isStableProgress(previousPartial, partial)) stablePartialHits++;
+                            else stablePartialHits = 1;
                             previousPartial = partial;
 
                             boolean confidenceOk = confidence <= 0f || confidence >= 0.38f;
